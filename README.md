@@ -5,8 +5,10 @@ A multi-source Discord music bot designed for Replit.
 ## Features
 
 - Searches and streams YouTube using yt-dlp
+- Suggests matching YouTube tracks while entering a `/play` query
 - Uses YouTube Music album artwork for track embeds when a matching song is found, with colors sampled from the cover
 - Adds interactive volume-down, mute, and volume-up buttons to track announcements (0–100%, 10% steps)
+- Adds a Loop button beneath volume controls to toggle repeating the current song
 - Formats playback command confirmations, queue listings, and playback errors as embeds
 - Queues up to 500 tracks per server
 - Sends timestamped, log-style queued and now-playing embeds to the configured playback channel
@@ -48,6 +50,7 @@ Text commands use `-` as the prefix:
 - `-skip`
 - `-queue`
 - `-remove <queue number or song title>`
+- `-clear` (clear the queue and stop playback without disconnecting)
 - `-kick <member> [reason]`
 - `-ki <member> [reason]` (alias for `-kick`)
 - `-ban <member> [reason]`
@@ -68,9 +71,11 @@ Text commands use `-` as the prefix:
 - `-leave`
 - `-help`
 
-Slash commands are available for music and help: `/play`, `/join`, `/pause`, `/resume`, `/skip`, `/queue`, `/stop`, `/leave`, `/help`. Moderation commands are text-only.
+Slash commands are available for music and help: `/play` offers YouTube search suggestions as you type, plus `/join`, `/pause`, `/resume`, `/skip`, `/queue`, `/stop`, `/leave`, and `/help`. Moderation commands are text-only.
 
 Send `-<message>` (for example, `-what songs are in the queue?`) or mention the bot with a message to get an AI reply as regular Discord text. Existing commands such as `-play` and `-ping` continue to work normally; a lone `-` asks you to add a message. The assistant receives a maintained summary of implemented features and commands plus the current server's queue/playback status. It cannot run music commands itself; use the listed text or slash commands. Chat replies require the API settings above.
+
+The `-skip` command removes the currently playing song from the queue and starts the next one; finished songs are automatically removed. Use `-clear` to clear the entire queue and stop playback while remaining connected to voice. `-stop` still clears the queue and disconnects.
 
 Moderation commands are text-only and permission-gated by Discord: kick, ban, and unban require their matching server permissions; timeout and untimeout require Moderate Members; purge and anti-message list management require Manage Messages. The short aliases (`-ki`, `-ba`, `-ub`, `-to`, `-uto`, `-pu`, and `-am`) run the same permission checks and behavior as their full commands. Unban accepts a Discord user ID because banned users cannot be mentioned from the server. Timeout durations accept `s`, `m`, `h`, `d`, or `w` (up to 28 days). The bot also needs the corresponding moderation permission and a role above the target.
 
