@@ -7,7 +7,7 @@ const commands = [
     .setName('play')
     .setDescription('Play a YouTube track or playlist')
     .addStringOption((option) =>
-      option.setName('query').setDescription('Song name or source link').setRequired(true)
+      option.setName('query').setDescription('Song name or source link').setRequired(true).setAutocomplete(true)
     )
     .toJSON(),
   new SlashCommandBuilder().setName('join').setDescription('Join your voice channel').toJSON(),

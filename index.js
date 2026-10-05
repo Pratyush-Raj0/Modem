@@ -23,6 +23,8 @@ const { getChatReply } = require('./chatbot');
 const { handleModerationCommand } = require('./moderation');
 const { filterAntiMessage, handleAntiMessageCommand } = require('./antimessages');
 const { logModerationAction, MODERATION_LOG_CHANNEL_ID } = require('./moderation-logs');
+const { searchYouTubeSuggestions } = require('./youtube-suggestions');
+const { clearQueue, handleTrackIdle, skipCurrentTrack } = require('./queue-controls');
 
 const client = new Client({
   intents: [
@@ -44,6 +46,7 @@ const DEFAULT_EMBED_COLOR = 0x5865f2;
 const SUCCESS_EMBED_COLOR = 0x57f287;
 const WARNING_EMBED_COLOR = 0xed4245;
 const VOLUME_STEP = 10;
+const AUTOCOMPLETE_RESPONSE_BUDGET_MS = 1700;
 const coverColorCache = new Map();
 let youtubeMusicClient;
 
@@ -82,6 +85,21 @@ function volumeControls() {
       .setCustomId('music-volume-up')
       .setLabel('🔊 Volume +')
       .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function stopCurrentTrack(state) {
+  state.skipCurrent = state.player.state.status !== AudioPlayerStatus.Idle;
+  state.loopCurrent = false;
+  state.player.stop();
+}
+
+function loopControls(isLooping = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('music-loop-toggle')
+      .setLabel(isLooping ? '🔁 Loop: On' : '🔁 Loop: Off')
+      .setStyle(isLooping ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
 }
 
@@ -297,14 +315,7 @@ function getGuildState(guildId) {
     player.on(AudioPlayerStatus.Idle, async () => {
       const state = queue.get(guildId);
       if (!state) return;
-      state.songs.shift();
-      state.failedSong = null;
-      state.resource = null;
-      if (state.songs.length) {
-        await playNext(guildId);
-      } else {
-        state.playing = false;
-      }
+      await handleTrackIdle(state, guildId, playNext);
     });
     player.on('error', (error) => {
       const state = queue.get(guildId);
@@ -319,6 +330,9 @@ function getGuildState(guildId) {
       playing: false,
       failedSong: null,
       resource: null,
+      playGeneration: 0,
+      loopCurrent: false,
+      skipCurrent: false,
       volume: 100,
       volumeBeforeMute: 100
     });
@@ -359,10 +373,12 @@ async function playNext(guildId) {
   }
 
   const song = state.songs[0];
+  const generation = ++state.playGeneration;
   state.playing = true;
   let process;
   try {
     await addYouTubeMusicArtwork(song);
+    if (state.playGeneration !== generation || state.songs[0] !== song) return;
     process = youtubeDl.exec(song.url, {
       format: 'bestaudio/best',
       output: '-',
@@ -382,6 +398,7 @@ async function playNext(guildId) {
     state.player.play(state.resource);
   } catch (error) {
     process?.kill();
+    if (state.playGeneration !== generation || state.songs[0] !== song) return;
     console.error(`Failed to play ${song.url}:`, error.message);
     state.songs.shift();
     if (state.songs.length) await playNext(guildId);
@@ -392,7 +409,7 @@ async function playNext(guildId) {
     const color = await getCoverColor(song.thumbnail);
     await state.textChannel?.send({
       embeds: [makePlaybackLogEmbed(song, color, 'now-playing')],
-      components: [volumeControls()]
+      components: [volumeControls(), loopControls(state.loopCurrent)]
     });
   } catch (error) {
     console.error('Could not send now-playing announcement:', error.message);
@@ -418,7 +435,7 @@ async function enqueue(guild, voiceChannel, resolved) {
   if (!state.playing) await playNext(guild.id);
   await textChannel.send({
     embeds: [makePlaybackLogEmbed(songs[0], color, 'queued')],
-    components: [volumeControls()]
+    components: [volumeControls(), loopControls(state.loopCurrent)]
   });
   return { songs, color };
 }
@@ -438,44 +455,55 @@ function helpEmbed() {
   return new EmbedBuilder()
     .setColor(DEFAULT_EMBED_COLOR)
     .setTitle('Musictrix')
-    .setDescription('Quick command guide · YouTube audio playback')
+    .setDescription('Commands use the `-` prefix. Slash commands are listed separately.')
     .addFields(
       {
         name: 'Music',
-        value: '`-play <song or YouTube link>`\n`/play <song or YouTube link>`',
+        value: '`-play <song or YouTube link>` — Search YouTube and add a song or playlist to the queue.\n`/play <query>` — Same playback command, with YouTube suggestions as you type.',
         inline: false
       },
       {
-        name: 'Playback',
-        value: '`-join` · `/join`  `-pause` · `/pause`  `-resume` · `/resume`\n`-skip` · `/skip`  `-queue` · `/queue`\n`-remove <number or title>`  `-stop` · `/stop`  `-leave` · `/leave`',
+        name: 'Playback controls',
+        value: '`-join` / `/join` — Join your voice channel.\n`-pause` / `/pause` — Pause the current song.\n`-resume` / `/resume` — Continue the paused song.\n`-skip` / `/skip` — Remove the current song and start the next queued song.\n`-queue` / `/queue` — Show queued songs and what is playing.\n`-remove <number or title>` — Remove one queued song; use its number if titles match.\n`-clear` — Clear the entire queue and stop playback, staying connected.\n`-stop` / `/stop` — Stop playback, clear the queue, and disconnect.\n`-leave` / `/leave` — Disconnect from voice.',
         inline: false
       },
       {
-        name: 'Chat & info',
-        value: '`-<message>` or mention the bot to chat\n`-ping` · `-invite` · `-server` · `-help`',
+        name: 'Chat & information',
+        value: '`-<message>` — Ask the chat assistant, for example `-what is in the queue?`.\n`@Musictrix <message>` — Chat by mentioning the bot.\n`-ping` — Show message and gateway latency.\n`-invite` — Get the bot invite link.\n`-server` — Get the bot owner’s server invite.\n`-help` — Show this command guide.',
         inline: false
       },
       {
         name: 'Moderation',
-        value: '`-kick/-ki <member> [reason]` · `-ban/-ba <member> [reason]` · `-unban/-ub <user ID> [reason]`\n`-timeout/-to <member> <duration> [reason]` · `-untimeout/-uto <member> [reason]`\n`-purge/-pu <1-100>` · `-antimessage/-am add/remove/list`',
+        value: '`-kick` / `-ki <member> [reason]` — Remove a member from the server.\n`-ban` / `-ba <member> [reason]` — Ban a member.\n`-unban` / `-ub <user ID> [reason]` — Unban a user by Discord ID.\n`-timeout` / `-to <member> <duration> [reason]` — Temporarily prevent a member from chatting (1 second–28 days; `s`, `m`, `h`, `d`, `w`).\n`-untimeout` / `-uto <member> [reason]` — Remove a member’s timeout.\n`-purge` / `-pu <1-100>` — Delete up to 100 recent messages.\nEach action requires the matching Discord permission; role hierarchy also applies.',
+        inline: false
+      },
+      {
+        name: 'Auto-purge filter',
+        value: '`-antimessage add <word or phrase>` / `-am add ...` — Add a term whose matching messages are deleted.\n`-antimessage remove <word or phrase>` / `-am remove ...` — Remove a blocked term.\n`-antimessage list` / `-am list` — Show this server’s blocked terms.\nRequires **Manage Messages**. Matching ignores case and uses whole words or exact phrases.',
+        inline: false
+      },
+      {
+        name: 'Slash commands & buttons',
+        value: 'Slash commands: `/play`, `/join`, `/pause`, `/resume`, `/skip`, `/queue`, `/stop`, `/leave`, `/help`.\nTrack buttons: **Volume − / Mute / Volume +** adjust volume; **Loop** repeats the current song until toggled off. Skipping or removing the current song disables looping.',
         inline: false
       }
     )
-    .setFooter({ text: 'Prefix commands work in server text channels' });
+    .setFooter({ text: 'Moderation actions and auto-purge changes are logged in the moderation log channel.' });
 }
 
 function getBotContext(guildId) {
   const state = queue.get(guildId);
   const commands = [
-    'Text commands: -play <song name, YouTube video URL, or playlist URL>; -join; -pause; -resume; -skip; -queue; -remove <queue number or song title>; -stop; -leave; -help; -ping; -invite; -server.',
-    '-play searches YouTube and queues tracks or playlist entries. -remove removes a matching queued song; use a queue number if a title is ambiguous. Removing the playing song advances playback. -queue shows queued tracks. -stop clears the queue and stops playback; -leave disconnects from voice. -skip advances to the next track. -pause and -resume control the current track. -join connects to the caller’s voice channel.',
+    'Text commands: -play <song name, YouTube video URL, or playlist URL>; -join; -pause; -resume; -skip; -queue; -remove <queue number or song title>; -clear; -stop; -leave; -help; -ping; -invite; -server.',
+    '-play searches YouTube and queues tracks or playlist entries. -remove removes a matching queued song; use a queue number if a title is ambiguous. Removing the playing song advances playback. -queue shows queued tracks. -clear immediately removes every queued track and stops the current one while staying connected to voice. -stop clears the queue, stops playback, and disconnects; -leave disconnects from voice. -skip removes the current song and starts the next queued song. Finished songs are removed automatically. -pause and -resume control the current track. -join connects to the caller’s voice channel.',
     '-ping reports message and gateway latency. -invite shares the Musictrix bot invite link. -server shares the bot owner’s server invite. -help displays the command guide.',
     'Slash commands: /play <query>, /join, /pause, /resume, /skip, /queue, /stop, /leave, /help. Slash commands do not include moderation or -remove.',
     'Moderation commands (and equivalent aliases): -kick/-ki <member> [reason], -ban/-ba <member> [reason], -unban/-ub <user ID> [reason], -timeout/-to <member> <duration> [reason], -untimeout/-uto <member> [reason], -purge/-pu <1-100>.',
     'Kick requires Kick Members; ban and unban require Ban Members; timeout and untimeout require Moderate Members; purge requires Manage Messages. For kick, ban, timeout, and untimeout, moderators cannot act on themselves or members at/elevated above their role; the bot must have the needed permission and role hierarchy. Unban takes a Discord user ID. Timeout duration units are s, m, h, d, or w, with a maximum of 28 days. Purge deletes 1 to 100 recent messages.',
     'Auto-purge commands: -antimessage/-am add <word or phrase>, -antimessage/-am remove <word or phrase>, -antimessage/-am list. Manage Messages is required to manage the list. Each server has up to 100 persisted terms; matching is case-insensitive, whole-word for words, and exact-phrase for phrases. Matching messages are automatically deleted if the bot has Manage Messages.',
     `Successful moderation actions, purges, auto-purged messages, and auto-purge list changes are logged in channel ${MODERATION_LOG_CHANNEL_ID}.`,
-    'Playback controls include volume-down, mute/unmute, and volume-up buttons on track messages; volume ranges from 0% to 100% in 10% steps.'
+    'Playback controls include volume-down, mute/unmute, and volume-up buttons on track messages; volume ranges from 0% to 100% in 10% steps.',
+    'The Loop button below volume controls toggles repeat for the currently playing song. When enabled, that song restarts at the end; disabling it returns to normal queue progression. Skipping or removing the current song clears loop mode.'
   ];
   const details = [
     'Musictrix is a Discord music bot and chat assistant. Users can chat by mentioning the bot or sending -<message>; chatbot replies are regular text. The bot can explain commands but cannot execute commands on a user’s behalf.',
@@ -537,7 +565,7 @@ async function removeQueuedSong(state, query, guildId) {
   const [song] = state.songs.slice(index, index + 1);
 
   if (index === 0 && state.playing) {
-    state.player.stop();
+    await skipCurrentTrack(state, guildId, playNext);
   } else {
     state.songs.splice(index, 1);
     if (index === 0 && state.songs.length && !state.playing) {
@@ -635,7 +663,7 @@ client.on(Events.MessageCreate, async (message) => {
       const result = await handlePlay(args.join(' '), message.guild, message.member);
       await message.reply({
         embeds: [makePlayConfirmation(result)],
-        components: [volumeControls()]
+        components: [volumeControls(), loopControls(getGuildState(guildId).loopCurrent)]
       });
     } catch (error) {
       await replyError(message.channel, error, 'Play command failed');
@@ -663,7 +691,7 @@ client.on(Events.MessageCreate, async (message) => {
     if (!state.songs.length) {
       return message.reply({ embeds: [makeEmbed('Queue is empty', 'There is no track to skip.', WARNING_EMBED_COLOR)] });
     }
-    state.player.stop();
+    await skipCurrentTrack(state, guildId, playNext);
     await message.reply({ embeds: [makeEmbed('Track skipped', 'Moving to the next track.', SUCCESS_EMBED_COLOR)] });
   } else if (command === 'remove') {
     try {
@@ -685,10 +713,21 @@ client.on(Events.MessageCreate, async (message) => {
       return message.reply({ embeds: [makeEmbed('Queue is empty', 'Add a track with `-play`.', WARNING_EMBED_COLOR)] });
     }
     await message.reply({ embeds: [queueEmbed(state.songs, state.playing)] });
+  } else if (command === 'clear') {
+    const state = getGuildState(guildId);
+    const clearedCount = state.songs.length;
+    clearQueue(state);
+    await message.reply({
+      embeds: [makeEmbed(
+        'Queue cleared',
+        `Cleared **${clearedCount}** queued song${clearedCount === 1 ? '' : 's'} and stopped playback. Still connected to voice.`,
+        SUCCESS_EMBED_COLOR
+      )]
+    });
   } else if (command === 'stop' || command === 'leave') {
     const state = getGuildState(guildId);
     if (command === 'stop') state.songs = [];
-    state.player.stop();
+    stopCurrentTrack(state);
     state.playing = false;
     if (state.connection) {
       state.connection.destroy();
@@ -725,7 +764,56 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const { commandName } = interaction;
   const guildId = interaction.guild.id;
 
+  if (interaction.isAutocomplete()) {
+    if (commandName !== 'play') return;
+    let timeoutId;
+    try {
+      const suggestions = await Promise.race([
+        searchYouTubeSuggestions(interaction.options.getFocused()),
+        new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve([]), AUTOCOMPLETE_RESPONSE_BUDGET_MS);
+        })
+      ]);
+      await interaction.respond(suggestions);
+    } catch (error) {
+      if (error.code === 10062 || error.code === 10015) {
+        console.debug('Autocomplete interaction expired before Discord accepted its response.');
+      } else {
+        console.warn('Could not respond to /play suggestions:', error.message);
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    return;
+  }
+
   if (interaction.isButton()) {
+    if (interaction.customId === 'music-loop-toggle') {
+      const state = queue.get(guildId);
+      if (!state?.playing || !state.songs.length) {
+        await interaction.reply({
+          embeds: [makeEmbed('No active song', 'Start a song before toggling loop.', WARNING_EMBED_COLOR)],
+          ephemeral: true
+        });
+        return;
+      }
+
+      state.loopCurrent = !state.loopCurrent;
+      await interaction.update({
+        components: [volumeControls(), loopControls(state.loopCurrent)]
+      });
+      await interaction.followUp({
+        embeds: [makeEmbed(
+          state.loopCurrent ? 'Song loop enabled' : 'Song loop disabled',
+          state.loopCurrent
+            ? `**${state.songs[0].title}** will replay when it ends.`
+            : `**${state.songs[0].title}** will advance to the next queued song when it ends.`,
+          SUCCESS_EMBED_COLOR
+        )],
+        ephemeral: true
+      });
+      return;
+    }
     if (!['music-volume-down', 'music-volume-mute', 'music-volume-up'].includes(interaction.customId)) return;
     const state = queue.get(guildId);
     if (!state?.playing || !state.resource?.volume) {
@@ -773,7 +861,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
       await interaction.editReply({
         embeds: [makePlayConfirmation(result)],
-        components: [volumeControls()]
+        components: [volumeControls(), loopControls(getGuildState(guildId).loopCurrent)]
       });
     } catch (error) {
       console.error('Slash play command failed:', error.message);
@@ -814,7 +902,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true
       });
     }
-    state.player.stop();
+    await skipCurrentTrack(state, guildId, playNext);
     await interaction.reply({
       embeds: [makeEmbed('Track skipped', 'Moving to the next track.', SUCCESS_EMBED_COLOR)],
       ephemeral: true
@@ -831,7 +919,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   } else if (commandName === 'stop' || commandName === 'leave') {
     const state = getGuildState(guildId);
     if (commandName === 'stop') state.songs = [];
-    state.player.stop();
+    stopCurrentTrack(state);
     state.playing = false;
     if (state.connection) {
       state.connection.destroy();
